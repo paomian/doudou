@@ -1,3 +1,4 @@
+use clap::Parser;
 use libc::{
     fcntl, ioctl, isatty, read, tcflush, tcgetattr, tcsetattr, termios, termios2, BOTHER, CBAUD,
     CLOCAL, CREAD, CRTSCTS, CS8, CSIZE, CSTOPB, F_GETFL, F_SETFL, O_NDELAY, O_NOCTTY, O_NONBLOCK,
@@ -5,12 +6,16 @@ use libc::{
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::runtime::{Builder, Runtime};
 
 // TODO add error handling
 
@@ -110,7 +115,7 @@ fn timestamp_m() -> u128 {
     since_the_epoch.as_millis()
 }
 
-fn read_data(fd: i32) {
+fn read_data(fd: i32, rt: &Runtime, tx: tokio::sync::mpsc::Sender<AirInfo>) {
     let mut buffer = [0u8; 1024];
     let n_read = unsafe { read(fd, buffer.as_mut_ptr() as *mut libc::c_void, 1024) };
     if n_read < 0 {
@@ -118,17 +123,54 @@ fn read_data(fd: i32) {
     } else {
         let result = calc_value(&buffer);
         let now = timestamp_m();
-        println!("{},{},{},{}", now, result.tvoc, result.ch2o, result.co2)
+        rt.spawn(async move {
+            tx.send(AirInfo {
+                info: result,
+                timestamp: now,
+            })
+            .await
+            .unwrap();
+        });
     }
 }
 
+struct AirInfo {
+    info: CalcResult,
+    timestamp: u128,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ConnectionInfo {
+    host: String,
+    dbname: String,
+    username: String,
+    password: String,
+}
+
+impl FromStr for ConnectionInfo {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_json::from_str(s)
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    device: String,
+    conn: ConnectionInfo,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    let device = args.device;
+    let conn = args.conn;
     let flags = O_RDWR | O_NOCTTY | O_NDELAY;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(flags)
-        // should be as a parameter
-        .open("/dev/ttyACM0")?;
+        .open(&device)?;
     let fd = file.as_raw_fd();
     let file_flag = unsafe { fcntl(fd, F_GETFL) };
     let file_flag = file_flag & !O_NONBLOCK;
@@ -141,9 +183,53 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("no tty.");
     }
     set_opt(fd, 9600);
+
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AirInfo>(100);
+    runtime.spawn(async move {
+        let client = reqwest::Client::new();
+        let mut count = 0;
+        while let Some(air_info) = rx.recv().await {
+            let dbname = conn.dbname.clone();
+            let username = conn.username.clone();
+            let password = conn.password.clone();
+            let url = format!("https://{}/v1/sql", conn.host);
+            let params = [("db", dbname)];
+            let url_with_params = reqwest::Url::parse_with_params(&url, &params);
+            if let Ok(final_url) = url_with_params {
+                let sql = format!(
+                    "insert into air (ts,tvoc,cho2,co2) values ({},{},{},{})",
+                    air_info.timestamp, air_info.info.tvoc, air_info.info.ch2o, air_info.info.co2
+                );
+                let form_params = [("sql", &sql)];
+                let res = client
+                    .post(final_url)
+                    .basic_auth(username, Some(password))
+                    .form(&form_params)
+                    .send()
+                    .await;
+                match res {
+                    Ok(_) => {
+                        count += 1;
+                        if count % 10 == 0 {
+                            println!("send data to server: {}", count);
+                        }
+                    }
+                    Err(e) => println!("error: {}", e),
+                }
+            } else {
+                println!("error parse url {}, params: {:?}", url, params);
+            }
+        }
+    });
     loop {
+        let tx_c = tx.clone();
         sleep(Duration::from_secs(3));
-        read_data(fd);
+        read_data(fd, &runtime, tx_c);
     }
     // Ok(())
 }
