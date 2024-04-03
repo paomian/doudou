@@ -1,0 +1,9 @@
+{
+    "device": "/dev/ttyACM0",
+    "conn": {
+        "host": "",
+        "dbname": "",
+        "username": "",
+        "password": ""
+    }
+}
