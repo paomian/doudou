@@ -1,0 +1,16 @@
+[Unit]
+Description=sync air data to greptime db
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/air-sync
+UserNS=auto:uidmapping=0:1000:1000,gidmapping=0:1000:1000
+AddDevice=/dev/ttyACM0
+
+[Service]
+# Restart service when sleep finishes
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
