@@ -6,16 +6,21 @@ use libc::{
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use tokio::signal::unix::{signal, SignalKind};
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc::Receiver;
 
 // TODO add error handling
 
@@ -158,14 +163,91 @@ impl FromStr for ConnectionInfo {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    #[arg(short, long)]
+    device: Option<String>,
+    #[arg(short, long)]
+    conn: Option<ConnectionInfo>,
+    #[arg(short = 'f', long)]
+    config_file: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
     device: String,
     conn: ConnectionInfo,
 }
 
+impl From<Args> for Config {
+    fn from(value: Args) -> Self {
+        match (value.device, value.conn, value.config_file) {
+            (Some(device), Some(conn), None) => Config { device, conn },
+            (None, None, Some(config_file)) => {
+                let content = std::fs::read_to_string(config_file).expect("error read file");
+                serde_json::from_str::<Config>(&content).expect("error parse json")
+            }
+            _ => panic!("invalid args"),
+        }
+    }
+}
+
+fn listen_data(runtime: &Runtime, conn: ConnectionInfo, mut rx: Receiver<AirInfo>) {
+    runtime.spawn(async move {
+        let client = reqwest::Client::new();
+        let mut count = 0;
+        while let Some(air_info) = rx.recv().await {
+            let dbname = conn.dbname.clone();
+            let username = conn.username.clone();
+            let password = conn.password.clone();
+            let url = format!("https://{}/v1/sql", conn.host);
+            let params = [("db", dbname)];
+            let url_with_params = reqwest::Url::parse_with_params(&url, &params);
+            if let Ok(final_url) = url_with_params {
+                let sql = format!(
+                    "insert into air_quality (ts,tvoc,cho2,co2) values ({},{},{},{})",
+                    air_info.timestamp, air_info.info.tvoc, air_info.info.ch2o, air_info.info.co2
+                );
+                let form_params = [("sql", &sql)];
+                let res = client
+                    .post(final_url)
+                    .basic_auth(username, Some(password))
+                    .form(&form_params)
+                    .send()
+                    .await;
+                match res {
+                    Ok(r) => {
+                        count += 1;
+                        if count % 10 == 0 {
+                            println!("send data to server: {}", count);
+                        }
+                        if let Err(response_error) = r.error_for_status() {
+                            println!("error status: {}", response_error);
+                        }
+                    }
+                    Err(e) => println!("error: {}", e),
+                }
+            } else {
+                println!("error parse url {}, params: {:?}", url, params);
+            }
+        }
+    });
+}
+
+fn handle_signal(runtime: &Runtime, stop: Arc<AtomicBool>) {
+    runtime.spawn(async move {
+        let stream = signal(SignalKind::terminate());
+        if let Ok(mut signal) = stream {
+            signal.recv().await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let device = args.device;
-    let conn = args.conn;
+    let config = Config::from(args);
+    let device = config.device;
+    let conn = config.conn;
+    let stop = Arc::new(AtomicBool::new(false));
     let flags = O_RDWR | O_NOCTTY | O_NDELAY;
     let file = OpenOptions::new()
         .read(true)
@@ -189,47 +271,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()
         .unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AirInfo>(100);
-    runtime.spawn(async move {
-        let client = reqwest::Client::new();
-        let mut count = 0;
-        while let Some(air_info) = rx.recv().await {
-            let dbname = conn.dbname.clone();
-            let username = conn.username.clone();
-            let password = conn.password.clone();
-            let url = format!("https://{}/v1/sql", conn.host);
-            let params = [("db", dbname)];
-            let url_with_params = reqwest::Url::parse_with_params(&url, &params);
-            if let Ok(final_url) = url_with_params {
-                let sql = format!(
-                    "insert into air (ts,tvoc,cho2,co2) values ({},{},{},{})",
-                    air_info.timestamp, air_info.info.tvoc, air_info.info.ch2o, air_info.info.co2
-                );
-                let form_params = [("sql", &sql)];
-                let res = client
-                    .post(final_url)
-                    .basic_auth(username, Some(password))
-                    .form(&form_params)
-                    .send()
-                    .await;
-                match res {
-                    Ok(_) => {
-                        count += 1;
-                        if count % 10 == 0 {
-                            println!("send data to server: {}", count);
-                        }
-                    }
-                    Err(e) => println!("error: {}", e),
-                }
-            } else {
-                println!("error parse url {}, params: {:?}", url, params);
-            }
-        }
-    });
+    let (tx, rx) = tokio::sync::mpsc::channel::<AirInfo>(100);
+    listen_data(&runtime, conn, rx);
+    handle_signal(&runtime, stop.clone());
     loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let tx_c = tx.clone();
         sleep(Duration::from_secs(3));
         read_data(fd, &runtime, tx_c);
     }
-    // Ok(())
+    Ok(())
 }
