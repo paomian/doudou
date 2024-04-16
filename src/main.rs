@@ -1,8 +1,8 @@
 use clap::Parser;
 use libc::{
     fcntl, ioctl, isatty, read, tcflush, tcgetattr, tcsetattr, termios, termios2, BOTHER, CBAUD,
-    CLOCAL, CREAD, CRTSCTS, CS8, CSIZE, CSTOPB, F_GETFL, F_SETFL, O_NDELAY, O_NOCTTY, O_NONBLOCK,
-    O_RDWR, TCGETS2, TCIOFLUSH, TCSANOW, TCSETS2, VMIN, VTIME,
+    CLOCAL, CREAD, CRTSCTS, CS8, CSIZE, CSTOPB, F_GETFL, F_SETFL, INPCK, O_NDELAY, O_NOCTTY,
+    O_NONBLOCK, O_RDWR, PARENB, TCGETS2, TCIOFLUSH, TCSANOW, TCSETS2, VMIN, VTIME,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -26,30 +26,52 @@ use tokio::sync::mpsc::Receiver;
 
 fn set_opt(fd: i32, baudrate: u32) {
     let mut new_tio = termios {
-        c_iflag: 0,
-        c_oflag: 0,
-        c_cflag: 0,
-        c_lflag: 0,
-        c_line: 0,
-        c_cc: [0; 32],
-        c_ispeed: 0,
-        c_ospeed: 0,
+        c_iflag: 0u32,
+        c_oflag: 0u32,
+        c_cflag: 6304u32,
+        c_lflag: 0u32,
+        c_line: 0u8,
+        c_cc: [0u8; 32],
+        c_ispeed: 0u32,
+        c_ospeed: 0u32,
     };
-    let tg_r = unsafe { tcgetattr(fd, &mut new_tio) };
-    if tg_r < 0 {
+
+    let mut old_tio = termios {
+        c_iflag: 0u32,
+        c_oflag: 0u32,
+        c_cflag: 0u32,
+        c_lflag: 0u32,
+        c_line: 0u8,
+        c_cc: [0u8; 32],
+        c_ispeed: 0u32,
+        c_ospeed: 0u32,
+    };
+    let tg_r = unsafe { tcgetattr(fd, &mut old_tio) };
+    if tg_r != 0 {
         println!("error tcgetattr.");
     }
-    new_tio.c_cflag = new_tio.c_cflag | CLOCAL | CREAD;
+    new_tio.c_cflag |= CLOCAL | CREAD;
     new_tio.c_cflag &= !CSIZE;
+
+    // set data bits
     new_tio.c_cflag |= CS8;
+
+    // parity
+    new_tio.c_cflag &= !PARENB;
+    new_tio.c_iflag &= !INPCK;
+
+    // stop bit
     new_tio.c_cflag &= !CSTOPB;
-    new_tio.c_cflag |= CRTSCTS;
+
+    // hardflow
+    new_tio.c_cflag &= !CRTSCTS;
+
     new_tio.c_cc[VMIN] = 0;
     new_tio.c_cc[VTIME] = 10;
     unsafe { tcflush(fd, TCIOFLUSH) };
 
     let tc_r = unsafe { tcsetattr(fd, TCSANOW, &new_tio) };
-    if tc_r < 0 {
+    if tc_r != 0 {
         println!("error tcsetattr.");
     }
     set_custom_baudrate(fd, baudrate);
@@ -67,7 +89,7 @@ fn set_custom_baudrate(fd: i32, baudrate: u32) {
         c_ospeed: 0,
     };
     let tcg_r = unsafe { ioctl(fd, TCGETS2, &tio) };
-    if tcg_r < 0 {
+    if tcg_r != 0 {
         println!("TCGETS2");
     }
     tio.c_cflag &= !CBAUD;
@@ -76,11 +98,11 @@ fn set_custom_baudrate(fd: i32, baudrate: u32) {
     tio.c_ospeed = baudrate;
 
     let tcs_r = unsafe { ioctl(fd, TCSETS2, &tio) };
-    if tcs_r < 0 {
+    if tcs_r != 0 {
         println!("TCSETS2");
     }
     let tcg_r = unsafe { ioctl(fd, TCGETS2, &tio) };
-    if tcg_r < 0 {
+    if tcg_r != 0 {
         println!("TCGETS2");
     }
 }
@@ -254,9 +276,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .custom_flags(flags)
         .open(&device)?;
     let fd = file.as_raw_fd();
-    let file_flag = unsafe { fcntl(fd, F_GETFL) };
-    let file_flag = file_flag & !O_NONBLOCK;
+
+    let mut file_flag = unsafe { fcntl(fd, F_GETFL, 0) };
+    file_flag &= !O_NONBLOCK;
     let set_result = unsafe { fcntl(fd, F_SETFL, file_flag) };
+
     if set_result < 0 {
         println!("error set.");
     }
@@ -267,7 +291,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     set_opt(fd, 9600);
 
     let runtime = Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
